@@ -2,223 +2,200 @@
 const chatForm = document.getElementById("chatForm");
 const userInput = document.getElementById("userInput");
 const chatWindow = document.getElementById("chatWindow");
+const sendBtn = document.getElementById("sendBtn");
+const latestQuestion = document.getElementById("latestQuestion");
 
-/* OpenAI settings */
-const apiUrl = "https://api.openai.com/v1/chat/completions";
-const apiKey = window.OPENAI_API_KEY || window.openaiApiKey || "";
+// Your Cloudflare Worker endpoint for OpenAI requests.
+const workerURL = "https://odd-shape-ef00.taylorramirez2005.workers.dev/";
 
-/* This keeps the chatbot focused on the right topic. */
-const systemPrompt =
-  "You are a friendly L'Oréal beauty assistant. Only answer questions related to L'Oréal products, skincare, makeup, haircare, fragrances, routines, beauty tips, and product recommendations. If the user asks about anything unrelated, politely refuse and explain that you can only help with L'Oréal and beauty-related topics. Then invite them to ask about a product, routine, or recommendation.";
+/*
+  System prompt:
+  Keeps the chatbot focused only on L'Oreal products, routines, and recommendations.
+*/
+const SYSTEM_PROMPT =
+  "You are the L'Oreal Product Advisor. You may only answer questions related to L'Oreal products, beauty routines, product recommendations, ingredients, shade selection, haircare, skincare, makeup, fragrance, and beauty usage tips. If a question is unrelated to L'Oreal or unrelated to beauty topics, politely refuse. Use this exact style for refusal: 'I can only help with L'Oreal products and beauty-related questions. Please ask me about products, routines, or recommendations.' Keep refusals short and friendly.";
 
-/* Keep track of the conversation so replies can use earlier context. */
-const conversationMemory = {
+// Store chat history so each request sends context in the required `messages` format.
+const messages = [
+  { role: "system", content: SYSTEM_PROMPT },
+  {
+    role: "assistant",
+    content:
+      "Hello! I can help with L'Oreal products, routines, and recommendations. What would you like help with today?",
+  },
+];
+
+// Light-weight memory for natural multi-turn conversations.
+const conversationState = {
   userName: "",
   pastQuestions: [],
 };
+let typingIndicatorEl = null;
 
-const chatHistory = [];
-
-let currentTurnQuestion = null;
-
-/* Build extra context for the model from the conversation history. */
-function buildMemoryContext() {
-  const memoryParts = [];
-
-  if (conversationMemory.userName) {
-    memoryParts.push(`The user's name is ${conversationMemory.userName}.`);
-  }
-
-  if (conversationMemory.pastQuestions.length > 0) {
-    memoryParts.push(
-      `Past user questions: ${conversationMemory.pastQuestions.join(" | ")}`,
-    );
-  }
-
-  return memoryParts.join(" ");
-}
-
-/* Build the full message list for OpenAI. */
-function buildMessages(userMessage) {
-  const messages = [
-    {
-      role: "system",
-      content: systemPrompt,
-    },
-  ];
-
-  const memoryContext = buildMemoryContext();
-
-  if (memoryContext) {
-    messages.push({
-      role: "system",
-      content: `Conversation memory: ${memoryContext}`,
-    });
-  }
-
-  messages.push(...chatHistory);
-
-  messages.push({
-    role: "user",
-    content: userMessage,
-  });
-
-  return messages;
-}
-
-/* Try to capture a user's name from their message. */
-function updateMemoryFromMessage(userMessage) {
-  const namePatterns = [
-    /(?:my name is|i am|i'm|im)\s+([A-Za-zÀ-ÿ'’-]{2,})/i,
-    /call me\s+([A-Za-zÀ-ÿ'’-]{2,})/i,
-  ];
-
-  for (const pattern of namePatterns) {
-    const match = userMessage.match(pattern);
-
-    if (match && match[1]) {
-      conversationMemory.userName = match[1].replace(/[.,!?]$/, "");
-      break;
-    }
-  }
-
-  conversationMemory.pastQuestions.push(userMessage);
-
-  if (conversationMemory.pastQuestions.length > 10) {
-    conversationMemory.pastQuestions.shift();
-  }
-}
-
-/* Add a message bubble to the chat window. */
-function addMessage(text, className) {
-  const messageElement = document.createElement("div");
-  messageElement.className = `msg ${className}`;
-  messageElement.textContent = text;
-  chatWindow.appendChild(messageElement);
-  chatWindow.scrollTop = chatWindow.scrollHeight;
-  return messageElement;
-}
-
-/* Start a new conversation turn with the user's latest question. */
-function startConversationTurn(userMessage) {
-  currentTurnQuestion = document.createElement("div");
-  currentTurnQuestion.className = "turn";
-
-  const questionLabel = document.createElement("div");
-  questionLabel.className = "turn-label turn-label-user";
-  questionLabel.textContent = "Your question";
-
-  const questionText = document.createElement("div");
-  questionText.className = "turn-question";
-  questionText.textContent = userMessage;
-
-  currentTurnQuestion.appendChild(questionLabel);
-  currentTurnQuestion.appendChild(questionText);
-  chatWindow.appendChild(currentTurnQuestion);
-  chatWindow.scrollTop = chatWindow.scrollHeight;
-  return currentTurnQuestion;
-}
-
-/* Add or replace the assistant response for the current turn. */
-function setTurnResponse(text) {
-  if (!currentTurnQuestion) {
-    return;
-  }
-
-  let responseElement = currentTurnQuestion.querySelector(".turn-response");
-
-  if (!responseElement) {
-    const responseLabel = document.createElement("div");
-    responseLabel.className = "turn-label turn-label-assistant";
-    responseLabel.textContent = "Assistant";
-
-    responseElement = document.createElement("div");
-    responseElement.className = "turn-response msg ai";
-
-    currentTurnQuestion.appendChild(responseLabel);
-    currentTurnQuestion.appendChild(responseElement);
-  }
-
-  responseElement.textContent = text;
-  chatWindow.scrollTop = chatWindow.scrollHeight;
-  return responseElement;
-}
-
-/* Show the first greeting message. */
-addMessage(
-  "Hello. Ask me about L'Oréal products, routines, or recommendations.",
-  "ai",
-);
-
-/* Send the user's message to OpenAI and show the reply. */
-async function sendMessage(userMessage) {
-  if (!apiKey) {
-    setTurnResponse(
-      "The OpenAI API key is missing. Add it in secrets.js as window.OPENAI_API_KEY.",
-    );
-    return;
-  }
-
-  setTurnResponse("Thinking…");
-
-  try {
-    const response = await fetch(apiUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        messages: buildMessages(userMessage),
-      }),
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      const errorMessage = data?.error?.message || "Something went wrong.";
-      setTurnResponse(`Sorry, I could not get a response. ${errorMessage}`);
-      return;
-    }
-
-    const reply = data?.choices?.[0]?.message?.content?.trim();
-
-    if (!reply) {
-      setTurnResponse("Sorry, I could not generate a reply just now.");
-      return;
-    }
-
-    chatHistory.push({
-      role: "user",
-      content: userMessage,
-    });
-
-    chatHistory.push({
-      role: "assistant",
-      content: reply,
-    });
-
-    setTurnResponse(reply);
-  } catch (error) {
-    setTurnResponse("There was a network problem. Please try again.");
-  }
-}
+// Render the first assistant message in the chat UI.
+appendMessage("ai", messages[1].content);
 
 /* Handle form submit */
-chatForm.addEventListener("submit", (event) => {
-  event.preventDefault();
+chatForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
 
-  const userMessage = userInput.value.trim();
-
-  if (!userMessage) {
+  const prompt = userInput.value.trim();
+  if (!prompt) {
     return;
   }
 
-  updateMemoryFromMessage(userMessage);
-  startConversationTurn(userMessage);
+  updateLatestQuestion(prompt);
+  updateConversationState(prompt);
+
+  appendMessage("user", prompt);
+  messages.push({ role: "user", content: prompt });
+
   userInput.value = "";
   userInput.focus();
+  setLoadingState(true);
+  showTypingIndicator();
 
-  sendMessage(userMessage);
+  try {
+    const reply = await getChatCompletion(getMessagesWithContext());
+
+    removeTypingIndicator();
+    appendMessage("ai", reply);
+    messages.push({ role: "assistant", content: reply });
+  } catch (error) {
+    removeTypingIndicator();
+    console.error("Chat request failed:", error);
+    appendMessage(
+      "ai",
+      "Sorry, I could not get a response right now. Please check your API setup and try again.",
+    );
+  } finally {
+    setLoadingState(false);
+  }
 });
+
+/*
+  Sends the `messages` array to your deployed Cloudflare Worker.
+  The Worker securely calls OpenAI using the server-side API key.
+*/
+async function getChatCompletion(conversationMessages) {
+  const endpoint = workerURL;
+
+  const headers = {
+    "Content-Type": "application/json",
+  };
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: "gpt-4o",
+      messages: conversationMessages,
+      max_completion_tokens: 300,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  const aiMessage = data.choices?.[0]?.message?.content;
+
+  if (!aiMessage) {
+    throw new Error("No message content returned by API");
+  }
+
+  return aiMessage.trim();
+}
+
+// Builds a short context message so the assistant remembers user details.
+function getMessagesWithContext() {
+  const memoryParts = [];
+
+  if (conversationState.userName) {
+    memoryParts.push(`User name: ${conversationState.userName}`);
+  }
+
+  if (conversationState.pastQuestions.length > 0) {
+    memoryParts.push(
+      `Past user questions: ${conversationState.pastQuestions.join(" | ")}`,
+    );
+  }
+
+  if (memoryParts.length === 0) {
+    return messages;
+  }
+
+  const memoryMessage = {
+    role: "system",
+    content: `Conversation context for continuity: ${memoryParts.join(". ")}`,
+  };
+
+  return [...messages, memoryMessage];
+}
+
+function updateLatestQuestion(questionText) {
+  latestQuestion.textContent = questionText;
+}
+
+function updateConversationState(questionText) {
+  const name = extractName(questionText);
+  if (name) {
+    conversationState.userName = name;
+  }
+
+  conversationState.pastQuestions.push(questionText);
+
+  // Keep only the most recent questions to limit token usage.
+  if (conversationState.pastQuestions.length > 6) {
+    conversationState.pastQuestions.shift();
+  }
+}
+
+function extractName(text) {
+  const match = text.match(
+    /(?:my name is|i am|i'm)\s+([a-zA-Z][a-zA-Z\-']{1,30})/i,
+  );
+  return match ? capitalizeName(match[1]) : "";
+}
+
+function capitalizeName(name) {
+  return name.charAt(0).toUpperCase() + name.slice(1).toLowerCase();
+}
+
+// Creates one chat row and keeps the scroll at the latest message.
+function appendMessage(role, text) {
+  const msg = document.createElement("div");
+  msg.classList.add("msg", role);
+
+  const speaker = role === "user" ? "You" : "L'Oreal Advisor";
+
+  const bubble = document.createElement("div");
+  bubble.classList.add("msg-bubble");
+  bubble.textContent = `${speaker}: ${text}`;
+
+  msg.appendChild(bubble);
+
+  chatWindow.appendChild(msg);
+  chatWindow.scrollTop = chatWindow.scrollHeight;
+
+  return msg;
+}
+
+function showTypingIndicator() {
+  removeTypingIndicator();
+  typingIndicatorEl = appendMessage("ai", "L'Oreal Advisor is typing...");
+  typingIndicatorEl.classList.add("typing-indicator");
+}
+
+function removeTypingIndicator() {
+  if (typingIndicatorEl && typingIndicatorEl.parentNode) {
+    typingIndicatorEl.parentNode.removeChild(typingIndicatorEl);
+  }
+  typingIndicatorEl = null;
+}
+
+function setLoadingState(isLoading) {
+  sendBtn.disabled = isLoading;
+  sendBtn.setAttribute("aria-busy", String(isLoading));
+}
